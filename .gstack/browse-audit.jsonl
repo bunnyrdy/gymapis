@@ -1,0 +1,6 @@
+{"ts":"2026-08-29T11:48:06.009Z","cmd":"goto","args":"http://localhost:5173/","origin":"http://localhost:5173/","durationMs":390,"status":"ok","hasCookies":false,"mode":"launched"}
+{"ts":"2026-08-29T11:48:08.271Z","cmd":"screenshot","args":"/tmp/site-home.png","origin":"http://localhost:5173/","durationMs":162,"status":"ok","hasCookies":false,"mode":"launched"}
+{"ts":"2026-08-29T11:48:08.359Z","cmd":"goto","args":"http://localhost:5173/plans","origin":"http://localhost:5173/plans","durationMs":38,"status":"ok","hasCookies":false,"mode":"launched"}
+{"ts":"2026-08-29T11:48:10.541Z","cmd":"screenshot","args":"/tmp/site-plans.png","origin":"http://localhost:5173/plans","durationMs":90,"status":"ok","hasCookies":false,"mode":"launched"}
+{"ts":"2026-08-29T11:48:10.617Z","cmd":"goto","args":"http://localhost:5173/contact","origin":"http://localhost:5173/contact","durationMs":29,"status":"ok","hasCookies":false,"mode":"launched"}
+{"ts":"2026-08-29T11:48:12.780Z","cmd":"screenshot","args":"/tmp/site-contact.png","origin":"http://localhost:5173/contact","durationMs":71,"status":"ok","hasCookies":false,"mode":"launched"}

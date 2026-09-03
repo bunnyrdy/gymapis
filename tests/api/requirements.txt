@@ -1,0 +1,7 @@
+pytest>=8.0
+requests>=2.32
+# The messaging tests read message_queue directly. An outbox cannot be verified
+# through HTTP alone — "the API returned 202" is exactly the thing that stayed
+# true when sending was silently broken — and the suite already requires a real
+# database to run at all.
+psycopg[binary]>=3.2

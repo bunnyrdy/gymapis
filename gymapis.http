@@ -1,0 +1,6 @@
+@gymapis_HostAddress = http://localhost:5023
+
+GET {{gymapis_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
