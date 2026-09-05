@@ -35,6 +35,8 @@ public static class MessagePurposes
     public const string PasswordChanged  = "password_changed";
     public const string RenewalReminder  = "renewal_reminder";
     public const string Offer            = "offer";
+    public const string RegistrationWelcome = "registration_welcome";
+    public const string RenewalConfirmation = "renewal_confirmation";
 
     /// <summary>
     /// Priority is a property of the purpose, never a caller's argument — a
@@ -44,6 +46,8 @@ public static class MessagePurposes
     public static string PriorityFor(string purpose) => purpose switch
     {
         PasswordReset or PasswordChanged => MessagePriorities.High,
+        RegistrationWelcome => MessagePriorities.Normal,
+        RenewalConfirmation => MessagePriorities.Normal,
         _                                => MessagePriorities.Normal,
     };
 
@@ -66,8 +70,11 @@ public static class MessagePurposes
     public static TimeSpan LifetimeFor(string purpose) => purpose switch
     {
         PasswordReset   => TimeSpan.FromHours(1),
+        RegistrationWelcome => TimeSpan.FromDays(3),
+        RenewalConfirmation => TimeSpan.FromDays(3),
         PasswordChanged => TimeSpan.FromHours(24),
         RenewalReminder => TimeSpan.FromDays(2),
+        
         _               => TimeSpan.FromDays(2),
     };
 }

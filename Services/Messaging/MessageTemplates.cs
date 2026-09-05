@@ -91,6 +91,55 @@ public static class MessageTemplates
               See you at the gym.
               """);
 
+
+      public static RenderedMessage RegistrationWelcome(string memberName,string planName,decimal amount, DateOnly paymentDate) => Wrap(
+      $"Welcome to {GymName}! Registration & Payment Successful",
+      html: $"""
+          <p>Hi {memberName},</p>
+
+          <p>Welcome to <strong>{GymName}</strong>! 🎉</p>
+
+          <p>Your registration has been completed successfully, your
+          <strong>{planName}</strong> membership is now active, and we've
+          received your payment.</p>
+
+          <p>
+              <strong>Payment Details</strong><br />
+              Amount Paid: <strong>₹{amount:N2}</strong><br />
+              Payment Date: <strong>{paymentDate:d MMMM yyyy}</strong>
+          </p>
+
+          <p>Thank you for choosing <strong>{GymName}</strong>. We're excited to
+          be part of your fitness journey and look forward to helping you achieve
+          your goals.</p>
+
+          <p>If you have any questions, our team at the front desk will be happy
+          to assist you.</p>
+
+          <p>See you at the gym!</p>
+          """,
+    text: $"""
+          Hi {memberName},
+
+          Welcome to {GymName}!
+
+          Your registration has been completed successfully, your
+          {planName} membership is now active, and we've received your payment.
+
+          Payment Details
+          ----------------
+          Amount Paid : ₹{amount:N2}
+          Payment Date: {paymentDate:d MMMM yyyy}
+
+          Thank you for choosing {GymName}. We're excited to be part of your
+          fitness journey and look forward to helping you achieve your goals.
+
+          If you have any questions, our team at the front desk will be happy
+          to assist you.
+
+          See you at the gym!
+          """);
+
     private static string Days(int n) => n == 1 ? "1 day" : $"{n} days";
 
     /// <summary>

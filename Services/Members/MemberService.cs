@@ -5,6 +5,7 @@ using GymApis.Models.Members;
 using GymApis.Models.Messaging;
 using GymApis.Repos;
 using GymApis.Services.Attendance; // IBranchClock — "this month" at the gym
+using GymApis.Services.Messaging;
 using GymApis.Services.Staff;      // ServiceResult<T>
 using GymApis.Services.Storage;
 using Microsoft.EntityFrameworkCore;
@@ -54,15 +55,18 @@ public class MemberService : IMemberService
     private readonly IBranchClock _clock;
     private readonly ILogger<MemberService> _log;
 
+    private readonly IMessageQueue _queue;
+
     public MemberService(
         GymDbContext db, IPhotoStorage photos, ICurrentUser actor,
-        IBranchClock clock, ILogger<MemberService> log)
+        IBranchClock clock, ILogger<MemberService> log, IMessageQueue queue)
     {
         _db = db;
         _photos = photos;
         _actor = actor;
         _clock = clock;
         _log = log;
+        _queue = queue;
     }
 
     // -----------------------------------------------------------------------
@@ -369,6 +373,18 @@ public class MemberService : IMemberService
                 new { member.MemberCode, Amount = req.PaidAmount, Method = req.PaymentMethod });
 
         await _db.SaveChangesAsync(ct);
+
+        if (!string.IsNullOrWhiteSpace(member.Email))
+        {
+            await _queue.EnqueueAsync(
+            MessagePurposes.RegistrationWelcome,
+            member.Email,
+            MessageTemplates.RegistrationWelcome(member.FullName, plan.Name, req.PaidAmount,_clock.TodayAsync(ct).Result),
+            memberId: member.Id,
+    ct: ct);
+            await _db.SaveChangesAsync(ct);
+        }
+          
 
         return ServiceResult<MemberResponse>.Ok((await GetAsync(member.Id, ct))!);
     }

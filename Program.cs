@@ -26,6 +26,7 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using System.Threading.RateLimiting;
 using Scalar.AspNetCore;
+using Microsoft.OpenApi;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -320,7 +321,23 @@ builder.Services.AddRateLimiter(options =>
     };
 });
 
-builder.Services.AddOpenApi();
+builder.Services.AddOpenApi(options =>
+{
+    options.AddDocumentTransformer((document, context, ct) =>
+    {
+        document.Components ??= new OpenApiComponents();
+        document.Components.SecuritySchemes ??= new Dictionary<string, IOpenApiSecurityScheme>();
+        document.Components.SecuritySchemes["Bearer"] = new OpenApiSecurityScheme
+        {
+            Type         = SecuritySchemeType.Http,
+            Scheme       = "bearer",
+            BearerFormat = "JWT",
+            In           = ParameterLocation.Header,
+            Description  = "Paste your JWT access token (no 'Bearer ' prefix)."
+        };
+        return Task.CompletedTask;
+    });
+}); // serves the spec at /openapi/v1.json in Development
 
 const string FrontendCors = "frontend";
 builder.Services.AddCors(o => o.AddPolicy(FrontendCors, p => p
