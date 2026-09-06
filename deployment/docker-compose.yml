@@ -1,0 +1,105 @@
+# Steel Flex, production.
+#
+#   cd gymapis/deployment && cp .env.example .env && $EDITOR .env
+#   docker compose up -d --build
+#
+# Assumes both repositories are cloned side by side:
+#   <root>/gymapis/                 (this repo — API, SQL, deployment)
+#   <root>/gym_frontend/            (the SPA)
+
+name: steelflex
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gmsdb
+      POSTGRES_USER: gmsdb
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      # Applied once, on a fresh volume, before the TCP port opens. See
+      # initdb.sh for why the order cannot be left to the filename sort.
+      - ./initdb.sh:/docker-entrypoint-initdb.d/00-schema.sh:ro
+      - ../sqlfiles:/sqlfiles:ro
+    # NO published port. Postgres is reachable only from this network; the
+    # host's 5432 stays closed. Reach it for a dump with `docker compose exec`.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gmsdb -d gmsdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [internal]
+
+  api:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      # __ maps to : in ASP.NET configuration. dotnet user-secrets is a
+      # development store and does not exist in a container; these are the
+      # production equivalent, and they come from .env, which is gitignored
+      # because this repository is public.
+      ConnectionStrings__Default: "Host=db;Port=5432;Database=gmsdb;Username=gmsdb;Password=${POSTGRES_PASSWORD}"
+      Jwt__SigningKey: ${JWT_SIGNING_KEY:?set JWT_SIGNING_KEY in .env}
+      Frontend__BaseUrl: "https://${SITE_DOMAIN:?set SITE_DOMAIN in .env}"
+      AllowedHosts: "${SITE_DOMAIN}"
+      # Must equal the subnet pinned at the bottom of this file. Program.cs
+      # reads it to decide whose X-Forwarded-For to trust; if the two drift,
+      # the rate limiter partitions every visitor into one bucket instead of
+      # erroring, which is the failure you will not notice until it bites.
+      ForwardedHeaders__KnownNetworks__0: "172.28.0.0/16"
+      Brevo__ApiKey: ${BREVO_API_KEY:-}
+      Brevo__FromEmail: ${BREVO_FROM_EMAIL:-}
+      # Creates the first owner on boot, then does nothing on every later boot.
+      # Delete both from .env once the owner has signed in and changed it.
+      Seed__OwnerEmail: ${SEED_OWNER_EMAIL:-}
+      Seed__OwnerPassword: ${SEED_OWNER_PASSWORD:-}
+    volumes:
+      # The gym's photographs. Without this line every redeploy destroys them —
+      # the container filesystem is thrown away on each `up --build`.
+      - uploads:/app/wwwroot/uploads
+    networks: [internal]
+
+  caddy:
+    build:
+      context: ../../gym_frontend
+      dockerfile: ../gymapis/deployment/Dockerfile.web
+    restart: unless-stopped
+    depends_on: [api]
+    environment:
+      SITE_DOMAIN: ${SITE_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # caddy_data holds the issued certificates and the ACME account key.
+      # Losing it means re-issuing on every restart, and Let's Encrypt rate
+      # limits that (5 identical certificates per week). It is the one volume
+      # here whose loss is immediately visible to visitors.
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [internal]
+
+volumes:
+  db_data:
+  uploads:
+  caddy_data:
+  caddy_config:
+
+networks:
+  internal:
+    driver: bridge
+    ipam:
+      config:
+        # Pinned, not left to Docker's pool, so ForwardedHeaders__KnownNetworks
+        # above is a fixed value rather than whatever subnet the daemon happened
+        # to allocate this week.
+        - subnet: 172.28.0.0/16

@@ -398,7 +398,7 @@ public record PlanOption(
     string DurationUnit,
     decimal Price);
 
-public class MemberQuery
+public class MemberQuery : IValidatableObject
 {
     [StringLength(80)]
     public string? Search { get; set; }
@@ -426,6 +426,24 @@ public class MemberQuery
     public string? Joined { get; set; }
 
     /// <summary>
+    /// A specific membership start month, 1-12. Requires <see cref="Year"/>.
+    ///
+    /// start_date, not joined_on and not paid_at. This window answers "which
+    /// debts were incurred in March", which is what a collections queue is asked
+    /// for — a member who joined in 2023 and bought an unpaid renewal in March
+    /// belongs in March's list, and joined_on would miss them.
+    /// </summary>
+    [Range(1, 12)]
+    public int? Month { get; set; }
+
+    /// <summary>
+    /// A specific year of membership start dates. Valid on its own — that is the
+    /// "previous year" filter, and it spans the whole year.
+    /// </summary>
+    [Range(2000, 2100)]
+    public int? Year { get; set; }
+
+    /// <summary>
     /// name (default) | balance_desc. Unset behaves exactly as the list always
     /// has, so no existing caller changes.
     /// </summary>
@@ -440,4 +458,14 @@ public class MemberQuery
     /// </summary>
     [Range(1, 100)]
     public int PageSize { get; set; } = 20;
+
+    public IEnumerable<ValidationResult> Validate(ValidationContext _)
+    {
+        // A year alone is the "previous year" filter and is fine. A month alone
+        // is not: "March" of no particular year has no window to resolve to.
+        // Same rule PaymentQuery carries, so the one filter bar behaves
+        // identically whichever endpoint the active tab reads.
+        if (Month is not null && Year is null)
+            yield return new("A month filter needs a year.", [nameof(Year)]);
+    }
 }

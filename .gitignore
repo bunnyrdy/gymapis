@@ -1,0 +1,33 @@
+# Build output
+bin/
+obj/
+
+# Uploaded photographs.
+#
+# In development these are stock images. In production they are photographs of
+# the gym's members and staff, and this repository is public — so this line is
+# the thing standing between a routine `git add .` and a personal-data
+# disclosure that survives every later deletion, because a blob stays reachable
+# by commit SHA. It is not a tidiness rule.
+#
+# The directory itself is kept via .gitkeep: PhotoStorage writes into it and
+# does not create the tree.
+wwwroot/uploads/*
+!wwwroot/uploads/.gitkeep
+
+# Production secrets. Connection string, JWT signing key, Brevo key, the seeded
+# owner password.
+deployment/.env
+
+# Tests
+**/__pycache__/
+.pytest_cache/
+
+# Local
+.DS_Store
+.vscode/
+
+# Unsplash photography that seed_demo_site.py downloads on first run. A cache,
+# not source — it re-fetches anything missing. Was covered by the repo-root
+# .gitignore before scripts/ moved in here.
+scripts/.demo-assets/

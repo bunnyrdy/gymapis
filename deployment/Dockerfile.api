@@ -1,0 +1,55 @@
+# The API. Built from the repository root:
+#   docker build -f deployment/Dockerfile.api -t steelflex-api .
+#
+# There are no EF migrations to run at startup — the SQL files own the schema
+# (see CLAUDE.md, rule 1), so this image only ever carries the application.
+
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
+WORKDIR /src
+
+# Restore as its own layer, keyed on the csproj alone. Editing a .cs file then
+# rebuilds without re-downloading every package.
+COPY gymapis.csproj ./
+RUN dotnet restore
+
+COPY . ./
+RUN dotnet publish -c Release -o /app --no-restore
+
+FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS runtime
+WORKDIR /app
+
+# curl is not in the aspnet image, and the healthcheck below needs something
+# that can speak HTTP. --no-install-recommends keeps it to the one binary.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# Non-root. The one directory this process writes to is the uploads volume,
+# mounted and chowned below; everything else can stay read-only to it. An
+# upload bug that escapes PhotoStorage's generated-filename rule then cannot
+# overwrite the application itself.
+RUN useradd --uid 64198 --create-home --shell /usr/sbin/nologin steelflex
+
+COPY --from=build /app ./
+
+# The mount point has to exist and be owned before the volume is attached, or
+# the first photo upload fails with a permission error that reads like a bug in
+# PhotoStorage.
+RUN mkdir -p /app/wwwroot/uploads && chown -R steelflex:steelflex /app/wwwroot
+
+USER steelflex
+
+ENV ASPNETCORE_URLS=http://+:8080 \
+    ASPNETCORE_ENVIRONMENT=Production \
+    DOTNET_RUNNING_IN_CONTAINER=true
+EXPOSE 8080
+
+# Hits the endpoint that checks the database, not just the socket. A process
+# that is up but cannot reach Postgres is not serving anything, and the point
+# of the probe is to say so.
+# --start-period covers first boot: the API waits on Postgres, and a restart
+# triggered during startup would loop forever without it.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl -fsS http://localhost:8080/health || exit 1
+
+ENTRYPOINT ["dotnet", "gymapis.dll"]

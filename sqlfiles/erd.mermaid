@@ -1,0 +1,228 @@
+erDiagram
+    tenants  ||--o{ branches : "has locations"
+    tenants  ||--o{ users : scopes
+    tenants  ||--o{ shifts : defines
+    tenants  ||--o{ tags : defines
+    tenants  ||--o{ membership_plans : offers
+    tenants  ||--o{ plan_services : defines
+
+    branches ||--o{ staff : employs
+    branches ||--o{ members : enrolls
+    branches ||--o{ staff_attendance : "recorded at"
+    branches ||--o{ member_checkins : "recorded at"
+    branches ||--o{ payments : "collected at"
+    branches ||--o{ memberships : "sold at"
+
+    users ||--o| staff : "login for"
+    users ||--o| members : "login for (v2)"
+
+    staff ||--o{ staff_tags : has
+    tags  ||--o{ staff_tags : labels
+    staff ||--o{ staff_shift_assignments : "rostered on"
+    shifts ||--o{ staff_shift_assignments : defines
+    staff ||--o{ staff_attendance : "marks daily"
+    staff ||--o{ pt_assignments : trains
+    staff ||--o{ memberships : "assigned trainer"
+
+    members ||--o{ memberships : purchases
+    members ||--o{ payments : pays
+    members ||--o{ member_checkins : "visits gym"
+    members ||--o{ pt_assignments : "enrolled in"
+
+    membership_plans ||--o{ memberships : "sold as"
+    membership_plans ||--o{ membership_plan_services : includes
+    plan_services    ||--o{ membership_plan_services : "listed in"
+    memberships ||--o{ payments : "settled by"
+
+    users ||--o{ activity_log : performs
+
+    tenants {
+        bigint id PK
+        text name
+        citext slug UK "subdomain"
+        text tagline
+        text logo_url
+        text status
+    }
+
+    branches {
+        bigint id PK
+        bigint tenant_id FK
+        text name
+        text code UK "per tenant"
+        text phone
+        text address_line1
+        char currency "INR"
+        text timezone "Asia/Kolkata"
+    }
+
+    users {
+        bigint id PK
+        bigint tenant_id FK
+        citext email UK "per tenant"
+        text password_hash
+        text role "owner|admin|manager|trainer|receptionist|member"
+        boolean is_active
+    }
+
+    staff {
+        bigint id PK
+        bigint tenant_id FK
+        bigint branch_id FK
+        bigint user_id FK
+        text staff_code UK "TRN-001 / REC-004"
+        text role "trainer|receptionist|manager|admin"
+        text full_name
+        text phone
+        text job_title "receptionists"
+        text specialization "trainers"
+        text_array qualifications
+        numeric experience_years
+        date joining_date
+        text status
+        timestamptz deleted_at
+    }
+
+    shifts {
+        bigint id PK
+        bigint tenant_id FK
+        text name "Morning|Mid-day|Evening|Flex"
+        time start_time
+        time end_time
+    }
+
+    staff_shift_assignments {
+        bigint id PK
+        bigint staff_id FK
+        bigint shift_id FK
+        smallint_array working_days "1=Mon..7=Sun"
+        date effective_from
+        date effective_to "NULL = current"
+    }
+
+    staff_attendance {
+        bigint id PK
+        bigint tenant_id FK
+        bigint branch_id FK
+        bigint staff_id FK
+        date attendance_date UK "one row per staff per day"
+        bigint shift_id FK "snapshot"
+        timestamptz check_in_at
+        timestamptz check_out_at
+        text status "present|absent|late|leave|.."
+        boolean is_late
+        text leave_reason
+    }
+
+    tags {
+        bigint id PK
+        bigint tenant_id FK
+        text category "responsibility|specialization"
+        text name
+    }
+
+    staff_tags {
+        bigint staff_id PK
+        bigint tag_id PK
+    }
+
+    members {
+        bigint id PK
+        bigint tenant_id FK
+        bigint branch_id FK
+        bigint user_id FK "NULL until member portal"
+        text member_code UK "MEM-2023-0142"
+        text full_name
+        text phone
+        citext email
+        date joined_on
+        text status
+        timestamptz deleted_at
+    }
+
+    membership_plans {
+        bigint id PK
+        bigint tenant_id FK
+        bigint branch_id FK "NULL = all branches"
+        text name
+        text plan_code UK "PLN-ANN-01"
+        int duration_value
+        text duration_unit "day|week|month"
+        numeric price
+        text_array features "free-text bullets"
+        boolean is_active
+        timestamptz archived_at
+    }
+
+    plan_services {
+        bigint id PK
+        bigint tenant_id FK
+        text name UK "Personal Training"
+        text description
+        boolean is_active
+        smallint display_order
+    }
+
+    membership_plan_services {
+        bigint plan_id PK
+        bigint service_id PK
+    }
+
+    memberships {
+        bigint id PK
+        bigint tenant_id FK
+        bigint branch_id FK
+        bigint member_id FK
+        bigint plan_id FK
+        date start_date
+        date end_date "auto-calculated"
+        numeric plan_price "snapshot"
+        numeric discount_amount
+        numeric total_amount "generated"
+        text status
+        bigint assigned_trainer_id FK
+    }
+
+    payments {
+        bigint id PK
+        bigint tenant_id FK
+        bigint branch_id FK
+        bigint member_id FK
+        bigint membership_id FK
+        text purpose
+        numeric amount
+        text method "cash|card|upi|.."
+        timestamptz paid_at
+        text status
+    }
+
+    member_checkins {
+        bigint id PK
+        bigint tenant_id FK
+        bigint branch_id FK
+        bigint member_id FK
+        timestamptz checked_in_at
+        timestamptz checked_out_at
+        text method "manual|qr|biometric"
+    }
+
+    pt_assignments {
+        bigint id PK
+        bigint tenant_id FK
+        bigint trainer_id FK
+        bigint member_id FK
+        int sessions_total
+        int sessions_used
+        text status
+    }
+
+    activity_log {
+        bigint id PK
+        bigint tenant_id FK
+        bigint actor_user_id FK
+        text action
+        text entity_type
+        bigint entity_id
+        text description
+        jsonb metadata
+    }

@@ -3,6 +3,7 @@ using GymApis.Models.Members;
 using GymApis.Repos;
 using GymApis.Services.Attendance;
 using GymApis.Services.Members;
+using GymApis.Services.Payments;
 using Microsoft.EntityFrameworkCore;
 
 namespace GymApis.Services.Dashboard;
@@ -21,8 +22,14 @@ namespace GymApis.Services.Dashboard;
 /// membership-state counts are taken over active members only, while the money
 /// is summed over everyone.
 ///
+/// This month's revenue used to be computed here, back when no module owned
+/// payments. One does now, so it is PaymentService.MonthlyCollectionAsync and
+/// the Monthly Revenue card composes it like everything else — the payments
+/// page and this card sum the same money, and two copies of that expression is
+/// how they would come to disagree.
+///
 /// What is genuinely new here is only what no module owns yet: this month's
-/// revenue, this month's joiners, the expiring shortlist, and the activity feed.
+/// joiners, the expiring shortlist, and the activity feed.
 /// </summary>
 public class DashboardService : IDashboardService
 {
@@ -38,6 +45,7 @@ public class DashboardService : IDashboardService
     private readonly GymDbContext _db;
     private readonly IMemberService _members;
     private readonly IAttendanceService _attendance;
+    private readonly IPaymentService _payments;
     private readonly IBranchClock _clock;
     private readonly ICurrentUser _actor;
 
@@ -45,12 +53,14 @@ public class DashboardService : IDashboardService
         GymDbContext db,
         IMemberService members,
         IAttendanceService attendance,
+        IPaymentService payments,
         IBranchClock clock,
         ICurrentUser actor)
     {
         _db = db;
         _members = members;
         _attendance = attendance;
+        _payments = payments;
         _clock = clock;
         _actor = actor;
     }
@@ -66,9 +76,6 @@ public class DashboardService : IDashboardService
 
     private IQueryable<Member> ScopedMembers() =>
         _db.Members.Where(m => m.TenantId == Tenancy.TenantId && m.BranchId == Tenancy.BranchId);
-
-    private IQueryable<Payment> ScopedPayments() =>
-        _db.Payments.Where(p => p.TenantId == Tenancy.TenantId && p.BranchId == Tenancy.BranchId);
 
     // The activity log is branch-nullable — a tenant-level action (a plan, which
     // is not branch-scoped) writes a null branch_id. Filtering on branch would
@@ -100,7 +107,7 @@ public class DashboardService : IDashboardService
         var today = await _clock.TodayAsync(ct);
 
         var newThisMonth = await NewMembersThisMonthAsync(today, ct);
-        var revenue = CanSeeRevenue() ? await MonthlyRevenueAsync(today, ct) : (decimal?)null;
+        var revenue = CanSeeRevenue() ? await _payments.MonthlyCollectionAsync(today, ct) : (decimal?)null;
 
         return new DashboardResponse(
             Kpis: new DashboardKpis(
@@ -142,30 +149,6 @@ public class DashboardService : IDashboardService
     {
         var monthStart = new DateOnly(today.Year, today.Month, 1);
         return ScopedMembers().CountAsync(m => m.JoinedOn >= monthStart, ct);
-    }
-
-    /// <summary>
-    /// Completed payments taken this month.
-    ///
-    /// Half-open instant range rather than a cast on paid_at: `paid_at >= start
-    /// AND paid_at &lt; nextStart` is sargable against idx_payments_revenue,
-    /// which schema_v1.sql built for this query and nothing has used until now.
-    /// Casting the column to a date in the branch timezone would ignore the
-    /// index and, worse, would be a STABLE expression Postgres cannot index.
-    ///
-    /// Only `completed` counts. A pending or failed payment is not revenue, and
-    /// a refund is a separate row that never became one — matching how
-    /// v_membership_balance decides what has been paid.
-    /// </summary>
-    private async Task<decimal> MonthlyRevenueAsync(DateOnly today, CancellationToken ct)
-    {
-        var monthStart = new DateOnly(today.Year, today.Month, 1);
-        var from = await _clock.StartOfDayAsync(monthStart, ct);
-        var to = await _clock.StartOfDayAsync(monthStart.AddMonths(1), ct);
-
-        return await ScopedPayments()
-            .Where(p => p.Status == "completed" && p.PaidAt >= from && p.PaidAt < to)
-            .SumAsync(p => (decimal?)p.Amount, ct) ?? 0m;
     }
 
     /// <summary>

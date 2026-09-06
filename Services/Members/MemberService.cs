@@ -148,6 +148,26 @@ public class MemberService : IMemberService
             rows = rows.Where(v => v.JoinedOn >= monthStart);
         }
 
+        // A named month of membership START dates — what the payments page's
+        // Pending and Expired tabs narrow on, so the desk can ask "who took a
+        // membership in August and still owes".
+        //
+        // No IBranchClock here, deliberately, and the contrast with the block
+        // above is the point: `joined=this_month` is a question about *now* and
+        // needs the branch's clock, because on the 1st before 05:30 IST a UTC
+        // "today" still says last month. An explicitly named month is a calendar
+        // fact — August 2026 is the same window in every timezone — so reaching
+        // for the clock here would add a round trip and answer nothing.
+        //
+        // Members with no membership have a null start_date and drop out, which
+        // is right: they have no debt to date.
+        if (q.Year is { } year)
+        {
+            var from = q.Month is { } month ? new DateOnly(year, month, 1) : new DateOnly(year, 1, 1);
+            var to = q.Month is not null ? from.AddMonths(1) : from.AddYears(1);
+            rows = rows.Where(v => v.StartDate >= from && v.StartDate < to);
+        }
+
         var total = await rows.CountAsync(ct);
 
         // Largest debt first for the work queue; by name everywhere else. An

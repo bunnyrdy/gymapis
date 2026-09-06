@@ -2,6 +2,8 @@ using GymApis.Dtos;
 using GymApis.Services.Auth;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
+using GymApis.Services;
 
 namespace GymApis.Controllers.Auth;
 
@@ -19,6 +21,11 @@ public class AuthController : ControllerBase
 
     public AuthController(IAuthService auth) => _auth = auth;
 
+    // Rate limiting is applied per action, not on the controller. login,
+    // forgot-password and reset-password are the guessable/expensive ones;
+    // refresh and logout must stay unlimited or the SPA's 401 interceptor signs
+    // a busy front desk out mid-shift. See RateLimitPolicies.Auth.
+    [EnableRateLimiting(RateLimitPolicies.Auth)]
     [HttpPost("login")]
     public async Task<IActionResult> Login(LoginRequest request, CancellationToken ct)
     {
@@ -48,6 +55,7 @@ public class AuthController : ControllerBase
     /// Always 202, even for an address with no account — otherwise this becomes
     /// an account-enumeration oracle.
     /// </summary>
+    [EnableRateLimiting(RateLimitPolicies.Auth)]
     [HttpPost("forgot-password")]
     public async Task<IActionResult> ForgotPassword(ForgotPasswordRequest request, CancellationToken ct)
     {
@@ -55,6 +63,7 @@ public class AuthController : ControllerBase
         return Accepted(new { message = "If that email has an account, a reset link is on its way." });
     }
 
+    [EnableRateLimiting(RateLimitPolicies.Auth)]
     [HttpPost("reset-password")]
     public async Task<IActionResult> ResetPassword(ResetPasswordRequest request, CancellationToken ct)
     {

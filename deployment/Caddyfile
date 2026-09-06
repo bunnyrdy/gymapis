@@ -1,0 +1,94 @@
+# Steel Flex — the only thing on this box that faces the internet.
+#
+# One origin for the whole application: Caddy serves the built SPA and
+# reverse-proxies the two API paths to the api container. That is what lets
+# .env.production ship VITE_API_BASE_URL=/api — the browser never makes a
+# cross-origin request, so there is no CORS entry to maintain and no second
+# hostname to publish.
+#
+# {$SITE_DOMAIN} comes from the compose environment. Caddy obtains and renews
+# the certificate itself; nothing here needs certbot or a renewal cron.
+
+{$SITE_DOMAIN} {
+	encode gzip zstd
+
+	header {
+		# Caddy already redirects http->https. HSTS is what stops the first
+		# request of a session going out in the clear at all.
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+
+		# The SPA's own CSP. Tailwind v4 emits a stylesheet rather than inline
+		# styles, but React inlines a style attribute for a handful of computed
+		# values, so style-src keeps 'unsafe-inline'. script-src does NOT —
+		# every bundle is a file Vite emitted, and that is the directive that
+		# matters for XSS.
+		#
+		# Uploaded photos are same-origin (proxied below), so 'self' covers
+		# them. blob: and data: are for the SPA's own client-side image resize
+		# in utils/image.ts, which previews a file before it is uploaded.
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+
+		# The stack is not the client's business.
+		-Server
+	}
+
+	# ORDER MATTERS. These two must come before the static handler below.
+	#
+	# Caddy's `handle` blocks are mutually exclusive and evaluated in order, so
+	# with the SPA fallback first, `try_files ... /index.html` would answer
+	# /api/anything with the HTML page — and every client error path breaks at
+	# once, because api.ts would parse HTML where it expects problem+json. A
+	# 404 from the API must stay a 404 with a `code` in it.
+	handle /api/* {
+		reverse_proxy api:8080
+	}
+
+	# Proxied to the API rather than served from the volume, deliberately. The
+	# API's static-file pipeline is what attaches X-Content-Type-Options and the
+	# restrictive per-file CSP that stop an uploaded image being re-read as a
+	# document — the other half of PhotoStorage's magic-byte check. Serving
+	# these from Caddy directly would silently drop that.
+	handle /uploads/* {
+		reverse_proxy api:8080
+	}
+
+	# Reachable from outside so an uptime monitor can watch the API rather than
+	# only the static site — without this it falls into the SPA handler below
+	# and answers 200 with index.html, which is the one failure mode a health
+	# check must not have. It leaks nothing: the body is the single word
+	# Healthy or Unhealthy, no version and no configuration.
+	#
+	# The container's own HEALTHCHECK does not come through here; it calls
+	# localhost:8080 inside the api container, so the probe keeps working even
+	# if Caddy is the thing that is down.
+	handle /health {
+		reverse_proxy api:8080
+	}
+
+	handle {
+		root * /srv
+
+		# Client-side routing: react-router owns every path under /app, and
+		# those URLs must survive a hard refresh and a pasted deep link. Any
+		# path that is not a real file becomes index.html and the SPA routes it.
+		try_files {path} /index.html
+		file_server
+
+		# The hashed asset filenames Vite emits are content-addressed, so they
+		# can be cached forever. index.html must not be — it is the file that
+		# names the current bundle, and a cached one pins a returning visitor
+		# to a deleted build.
+		@immutable path /assets/*
+		header @immutable Cache-Control "public, max-age=31536000, immutable"
+		header /index.html Cache-Control "no-cache"
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

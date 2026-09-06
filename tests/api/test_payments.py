@@ -1,0 +1,522 @@
+"""Payments module guards.
+
+The payments page is a read model over a ledger that already existed, so most of
+what can go wrong here is silent: a window that resolves to the wrong month, a
+card that counts differently from the tab it opens, a receipt number that
+repeats, or a filter that quietly returns everything.
+
+Four invariants this file exists to hold:
+
+  * The month boundary is the branch's, and `?range=this_month` sums to exactly
+    what the dashboard's Monthly Revenue card reports. One expression, two
+    screens — that is why MonthlyCollectionAsync moved into PaymentService.
+  * Receipt numbers are unique and every row has one. The column carried
+    UNIQUE (tenant_id, receipt_no) from day one and nothing enforced it, because
+    every value was NULL.
+  * The stats agree with the tabs they open. membersOwing has to equal the
+    Pending tab's row count, or a card contradicts its own list.
+  * An erased member's payments stay in the ledger, with their personal data
+    already overwritten. Personal data goes; the accounting record stays.
+
+Black-box: needs the API running and a real database.
+"""
+import datetime
+import re
+
+import pytest
+
+PAYMENTS = "/api/payments"
+MEMBERS = "/api/members"
+
+RECEIPT = re.compile(r"^RCP-\d{6}$")
+
+
+@pytest.fixture
+def auth(tokens):
+    return {"Authorization": f"Bearer {tokens['accessToken']}"}
+
+
+@pytest.fixture
+def plan(api, auth):
+    r = api.post(f"{api.base}/api/membership-plans", headers=auth, json={
+        "name": "Payments Fixture Plan",
+        "durationValue": 1,
+        "durationUnit": "month",
+        "price": 1000.00,
+        "serviceIds": [],
+        "isActive": True,
+    })
+    assert r.status_code == 201, r.text
+    created = r.json()
+    yield created
+    api.delete(f"{api.base}/api/membership-plans/{created['id']}", headers=auth)
+
+
+def form(plan, **overrides):
+    payload = {
+        "FullName": "Payments Fixture Member",
+        "Phone": "9876500011",
+        "Email": "payments.fixture@example.com",
+        "Gender": "male",
+        "Status": "active",
+        "PlanId": plan["id"],
+        "JoiningDate": "2024-01-01",
+        "DiscountAmount": "0",
+        "PaidAmount": "0",
+        "PaymentMethod": "cash",
+    }
+    payload.update(overrides)
+    return payload
+
+
+@pytest.fixture
+def member(api, auth, plan):
+    """A member with an unpaid 1000.00 membership, cleaned up afterwards."""
+    r = api.post(f"{api.base}{MEMBERS}", headers=auth, data=form(plan))
+    assert r.status_code == 201, r.text
+    created = r.json()
+    yield created
+    api.post(f"{api.base}{MEMBERS}/{created['id']}/erase", headers=auth)
+
+
+def pay(api, auth, member, amount, **overrides):
+    """Record a payment through the one write path there is."""
+    membership_id = member["currentMembership"]["id"]
+    body = {"amount": amount, "method": "cash"}
+    body.update(overrides)
+    r = api.post(
+        f"{api.base}{MEMBERS}/{member['id']}/memberships/{membership_id}/payments",
+        headers=auth,
+        json=body,
+    )
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def ledger(api, auth, **params):
+    r = api.get(f"{api.base}{PAYMENTS}", headers=auth, params=params)
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+# --- authorization ---------------------------------------------------------
+
+@pytest.mark.parametrize("path", [PAYMENTS, f"{PAYMENTS}/stats"])
+def test_anonymous_is_rejected(api, path):
+    assert api.get(f"{api.base}{path}").status_code == 401
+
+
+def test_money_totals_are_present_for_the_owner(api, auth):
+    """The three nullable figures are the field-level privilege.
+
+    An owner sees them. A receptionist gets null and the card does not render —
+    which cannot be asserted over HTTP because there is no user-creation
+    endpoint, the same gap test_dashboard.py skips for.
+    """
+    r = api.get(f"{api.base}{PAYMENTS}/stats", headers=auth)
+    assert r.status_code == 200, r.text
+    stats = r.json()
+
+    assert stats["thisMonthCollection"] is not None
+    assert stats["totalOutstanding"] is not None
+    assert stats["totalPaymentsValue"] is not None
+    assert isinstance(stats["membersOwing"], int)
+    assert isinstance(stats["totalPaymentsReceived"], int)
+
+
+# --- paging ----------------------------------------------------------------
+
+def test_page_size_is_capped(api, auth):
+    """Without a ceiling this is a contact-list export: the rows carry phones."""
+    r = api.get(f"{api.base}{PAYMENTS}", headers=auth, params={"pageSize": 1000000})
+    assert r.status_code == 400
+
+
+def test_paging_defaults_and_is_consistent(api, auth):
+    page = ledger(api, auth, range="all")
+    assert page["page"] == 1
+    assert page["pageSize"] == 20
+    assert len(page["items"]) <= 20
+    if page["totalCount"]:
+        assert page["totalPages"] == -(-page["totalCount"] // page["pageSize"])
+
+
+# --- receipt numbers -------------------------------------------------------
+
+def test_every_payment_has_a_receipt_number(api, auth, member):
+    """Generated by the payments table's DEFAULT, so no write path can forget."""
+    pay(api, auth, member, 100)
+    rows = ledger(api, auth, range="all", search=member["memberCode"])["items"]
+
+    assert rows, "the payment should be in the ledger"
+    for row in rows:
+        assert RECEIPT.match(row["receiptNo"] or ""), row["receiptNo"]
+
+
+def test_consecutive_payments_get_distinct_receipt_numbers(api, auth, member):
+    pay(api, auth, member, 100)
+    pay(api, auth, member, 150)
+
+    rows = ledger(api, auth, range="all", search=member["memberCode"])["items"]
+    numbers = [r["receiptNo"] for r in rows]
+    assert len(numbers) == len(set(numbers)), numbers
+
+
+def test_no_payment_row_is_missing_a_receipt_number(q):
+    """The 010 backfill. A NULL here would be a row the ledger cannot identify."""
+    assert q("SELECT count(*) FROM payments WHERE receipt_no IS NULL")[0][0] == 0
+
+
+def test_receipt_numbers_are_unique_per_tenant(q):
+    """UNIQUE (tenant_id, receipt_no) existed from day one and never bit,
+
+    because Postgres treats NULLs as distinct and every value was NULL.
+    """
+    dupes = q(
+        "SELECT count(*) FROM ("
+        "  SELECT tenant_id, receipt_no FROM payments"
+        "  GROUP BY 1, 2 HAVING count(*) > 1) x"
+    )
+    assert dupes[0][0] == 0
+
+
+# --- the window ------------------------------------------------------------
+
+def test_a_back_dated_payment_falls_out_of_this_month(api, auth, member):
+    """The tab split. `previous` is everything before this month began."""
+    last_month = (datetime.date.today().replace(day=1) - datetime.timedelta(days=1))
+    paid_at = f"{last_month.isoformat()}T10:00:00+00:00"
+    pay(api, auth, member, 100, paidAt=paid_at)
+
+    code = member["memberCode"]
+    this_month = ledger(api, auth, range="this_month", search=code)["totalCount"]
+    previous = ledger(api, auth, range="previous", search=code)["totalCount"]
+    every = ledger(api, auth, range="all", search=code)["totalCount"]
+
+    assert this_month == 0
+    assert previous == 1
+    assert every == 1
+
+
+def test_a_custom_range_includes_both_ends(api, auth, member):
+    """`to` is inclusive to the caller; the service turns it into the next day."""
+    last_month = (datetime.date.today().replace(day=1) - datetime.timedelta(days=1))
+    pay(api, auth, member, 100, paidAt=f"{last_month.isoformat()}T10:00:00+00:00")
+
+    found = ledger(
+        api, auth,
+        search=member["memberCode"],
+        **{"from": last_month.isoformat(), "to": last_month.isoformat()},
+    )
+    assert found["totalCount"] == 1
+
+
+def test_a_backwards_range_is_rejected(api, auth):
+    r = api.get(f"{api.base}{PAYMENTS}", headers=auth,
+                params={"from": "2026-03-10", "to": "2026-03-01"})
+    assert r.status_code == 400
+
+
+def test_a_month_without_a_year_is_rejected(api, auth):
+    """"March" of no particular year has no window to resolve to."""
+    r = api.get(f"{api.base}{PAYMENTS}", headers=auth, params={"month": 3})
+    assert r.status_code == 400
+
+
+def test_a_year_alone_is_allowed(api, auth):
+    """That is the "previous year" filter, and it spans the whole year."""
+    r = api.get(f"{api.base}{PAYMENTS}", headers=auth, params={"year": 2024})
+    assert r.status_code == 200, r.text
+
+
+def test_this_month_agrees_with_the_dashboard(api, auth, member):
+    """The test that guards moving MonthlyRevenueAsync into PaymentService.
+
+    Both figures now come from one expression. If someone reintroduces a second
+    copy and the two drift, this fails.
+    """
+    pay(api, auth, member, 250)
+
+    dashboard = api.get(f"{api.base}/api/dashboard", headers=auth)
+    assert dashboard.status_code == 200, dashboard.text
+    revenue = dashboard.json()["kpis"]["monthlyRevenue"]
+
+    stats = api.get(f"{api.base}{PAYMENTS}/stats", headers=auth).json()
+    assert float(stats["thisMonthCollection"]) == pytest.approx(float(revenue))
+
+    # And the tab's rows sum to the same figure, one page at a time.
+    total, page = 0.0, 1
+    while True:
+        chunk = ledger(api, auth, range="this_month", page=page, pageSize=100)
+        total += sum(float(r["amount"]) for r in chunk["items"] if r["status"] == "completed")
+        if page >= chunk["totalPages"]:
+            break
+        page += 1
+
+    assert total == pytest.approx(float(revenue))
+
+
+# --- filters ---------------------------------------------------------------
+
+def test_search_matches_name_code_and_receipt(api, auth, member):
+    pay(api, auth, member, 100)
+    row = ledger(api, auth, range="all", search=member["memberCode"])["items"][0]
+
+    for term in (member["fullName"], member["memberCode"], row["receiptNo"]):
+        found = ledger(api, auth, range="all", search=term)
+        assert found["totalCount"] >= 1, term
+
+
+def test_phone_is_its_own_filter(api, auth, member):
+    pay(api, auth, member, 100)
+    found = ledger(api, auth, range="all", phone=member["phone"])
+    assert found["totalCount"] >= 1
+    assert all(r["phone"] == member["phone"] for r in found["items"])
+
+
+def test_plan_filter_narrows(api, auth, member, plan):
+    pay(api, auth, member, 100)
+
+    mine = ledger(api, auth, range="all", planId=plan["id"], search=member["memberCode"])
+    assert mine["totalCount"] == 1
+
+    foreign = ledger(api, auth, range="all", planId=9_999_999)
+    assert foreign["totalCount"] == 0
+
+
+def test_balance_due_only_excludes_settled_memberships(api, auth, member):
+    """The membership's balance, not the payment's — so settling it in full
+
+    drops every one of its instalment rows out of this filter together.
+    """
+    code = member["memberCode"]
+    pay(api, auth, member, 400)
+    assert ledger(api, auth, range="all", search=code, balanceDueOnly=True)["totalCount"] == 1
+
+    pay(api, auth, member, 600)   # settles the 1000.00 membership
+    assert ledger(api, auth, range="all", search=code, balanceDueOnly=True)["totalCount"] == 0
+    assert ledger(api, auth, range="all", search=code)["totalCount"] == 2
+
+
+def test_an_unknown_status_is_ignored_not_rejected(api, auth):
+    """A stale bookmark shows the list, not a 400 — MemberService's rule."""
+    unknown = ledger(api, auth, range="all", paymentStatus="foo")
+    every = ledger(api, auth, range="all")
+    assert unknown["totalCount"] == every["totalCount"]
+
+
+def test_status_filter_is_the_memberships_not_the_transactions(api, auth, member):
+    """The dropdown filters how much of the MEMBERSHIP is settled.
+
+    The transaction's own status is a constant — every write path hard-codes
+    "completed" and there is no refund path — so a filter over it could only
+    ever offer one option that matched anything. This one varies.
+    """
+    code = member["memberCode"]
+
+    # 400 of 1000: the membership is now partial, and so is its one payment row.
+    pay(api, auth, member, 400)
+    assert ledger(api, auth, range="all", search=code, paymentStatus="partial")["totalCount"] == 1
+    assert ledger(api, auth, range="all", search=code, paymentStatus="paid")["totalCount"] == 0
+
+    # Settling it moves BOTH rows to paid — balance is the membership's, and it
+    # is repeated across every instalment against it.
+    pay(api, auth, member, 600)
+    assert ledger(api, auth, range="all", search=code, paymentStatus="partial")["totalCount"] == 0
+    assert ledger(api, auth, range="all", search=code, paymentStatus="paid")["totalCount"] == 2
+
+
+def test_owing_is_the_union_of_pending_and_partial(api, auth, member):
+    """Same meaning as MemberService's `owing`, so one dropdown drives both.
+
+    A member who has paid nothing has no payment row at all (CHECK amount > 0),
+    so on the ledger `owing` and `partial` select the same rows — which is
+    exactly why the UI sends anyone asking for "Pending" to the member-shaped
+    tab instead.
+    """
+    code = member["memberCode"]
+    pay(api, auth, member, 400)
+
+    owing = ledger(api, auth, range="all", search=code, paymentStatus="owing")
+    partial = ledger(api, auth, range="all", search=code, paymentStatus="partial")
+    assert owing["totalCount"] == partial["totalCount"] == 1
+
+
+def test_paid_and_partial_partition_the_ledger(api, auth):
+    """Nothing is lost or double-counted between the two states."""
+    every = ledger(api, auth, range="all")["totalCount"]
+    paid = ledger(api, auth, range="all", paymentStatus="paid")["totalCount"]
+    partial = ledger(api, auth, range="all", paymentStatus="partial")["totalCount"]
+
+    # A payment whose membership was deleted has a null payment_status and
+    # belongs to neither, so this is <= rather than ==.
+    assert paid + partial <= every
+    assert paid and partial, "fixture data should exercise both sides"
+
+
+# --- the member-shaped tabs' month/year window -----------------------------
+
+def test_members_can_be_filtered_by_membership_start_month(api, auth, member):
+    """Month/Year on /api/members narrows the membership START date.
+
+    Not joined_on: a member who joined in 2023 and bought an unpaid renewal in
+    August belongs in August's collections queue, and joined_on would miss them.
+    """
+    start = member["currentMembership"]["startDate"]
+    year, month = int(start[:4]), int(start[5:7])
+
+    hit = api.get(f"{api.base}{MEMBERS}", headers=auth,
+                  params={"search": member["memberCode"], "year": year, "month": month})
+    assert hit.status_code == 200, hit.text
+    assert hit.json()["totalCount"] == 1
+
+    # The month either side must not contain it.
+    other = month % 12 + 1
+    other_year = year + 1 if other < month else year
+    miss = api.get(f"{api.base}{MEMBERS}", headers=auth,
+                   params={"search": member["memberCode"], "year": other_year, "month": other})
+    assert miss.json()["totalCount"] == 0
+
+
+def test_a_year_alone_spans_the_year(api, auth, member):
+    start = member["currentMembership"]["startDate"]
+    r = api.get(f"{api.base}{MEMBERS}", headers=auth,
+                params={"search": member["memberCode"], "year": int(start[:4])})
+    assert r.status_code == 200, r.text
+    assert r.json()["totalCount"] == 1
+
+
+def test_a_member_month_without_a_year_is_rejected(api, auth):
+    """Same cross-field rule PaymentQuery carries, so one filter bar behaves
+
+    identically whichever endpoint the active tab reads.
+    """
+    r = api.get(f"{api.base}{MEMBERS}", headers=auth, params={"month": 3})
+    assert r.status_code == 400
+
+
+def test_the_month_window_combines_with_the_owing_filter(api, auth, member):
+    """The Pending tab sends both at once; they must narrow together."""
+    start = member["currentMembership"]["startDate"]
+    pay(api, auth, member, 400)   # partial — still owes
+
+    both = api.get(f"{api.base}{MEMBERS}", headers=auth, params={
+        "search": member["memberCode"],
+        "year": int(start[:4]),
+        "month": int(start[5:7]),
+        "paymentStatus": "owing",
+        "sort": "balance_desc",
+    })
+    assert both.status_code == 200, both.text
+    assert both.json()["totalCount"] == 1
+
+    pay(api, auth, member, 600)   # settled — drops out of the queue
+    settled = api.get(f"{api.base}{MEMBERS}", headers=auth, params={
+        "search": member["memberCode"],
+        "year": int(start[:4]),
+        "month": int(start[5:7]),
+        "paymentStatus": "owing",
+    })
+    assert settled.json()["totalCount"] == 0
+
+
+def test_the_default_member_list_is_unchanged(api, auth):
+    """The new parameters are additive. Omitting them must behave as before."""
+    plain = api.get(f"{api.base}{MEMBERS}", headers=auth)
+    assert plain.status_code == 200, plain.text
+    body = plain.json()
+    assert body["page"] == 1 and body["pageSize"] == 20
+
+
+# --- the cards agree with the tabs they open -------------------------------
+
+def test_members_owing_matches_the_pending_tab(api, auth, member):
+    """The card opens this list. A separate count here is the drift
+
+    v_member_overview exists to prevent.
+    """
+    stats = api.get(f"{api.base}{PAYMENTS}/stats", headers=auth).json()
+
+    owing = api.get(f"{api.base}{MEMBERS}", headers=auth,
+                    params={"paymentStatus": "owing", "sort": "balance_desc"})
+    assert owing.status_code == 200, owing.text
+
+    assert stats["membersOwing"] == owing.json()["totalCount"]
+
+
+def test_total_outstanding_matches_member_stats(api, auth):
+    stats = api.get(f"{api.base}{PAYMENTS}/stats", headers=auth).json()
+    members = api.get(f"{api.base}{MEMBERS}/stats", headers=auth).json()
+
+    assert float(stats["totalOutstanding"]) == pytest.approx(
+        float(members["pendingPaymentsValue"]))
+
+
+def test_the_visible_figures_move_with_the_filter(api, auth, member):
+    """"Cards should apply filters", read in reverse: two of the four describe
+
+    the rows currently in view, so they have to be computed over the window the
+    table is showing.
+    """
+    pay(api, auth, member, 100)
+
+    narrow = api.get(f"{api.base}{PAYMENTS}/stats", headers=auth,
+                     params={"range": "all", "search": member["memberCode"]}).json()
+    assert narrow["totalPaymentsReceived"] == 1
+    assert float(narrow["totalPaymentsValue"]) == pytest.approx(100.0)
+
+    wide = api.get(f"{api.base}{PAYMENTS}/stats", headers=auth,
+                   params={"range": "all"}).json()
+    assert wide["totalPaymentsReceived"] >= narrow["totalPaymentsReceived"]
+
+    # Outstanding is a standing figure and must NOT move with the window: money
+    # owed does not belong to the month it was invoiced in.
+    assert narrow["totalOutstanding"] == wide["totalOutstanding"]
+
+
+# --- the view's two deliberate behaviours ----------------------------------
+
+def test_an_erased_members_payments_stay_in_the_ledger(api, auth, plan):
+    """DPDP: personal data goes, the accounting record stays.
+
+    EraseAsync overwrites the name and phone and deliberately keeps member_code
+    — "the only handle the payments ledger has left". So v_payment_ledger joins
+    `members` with no deleted_at filter, and revenue is unchanged by an erasure.
+    """
+    created = api.post(f"{api.base}{MEMBERS}", headers=auth,
+                       data=form(plan, FullName="Erasure Ledger Member",
+                                 Phone="9876500022",
+                                 Email="erasure.ledger@example.com")).json()
+    pay(api, auth, created, 300)
+    code = created["memberCode"]
+
+    before = api.get(f"{api.base}{PAYMENTS}/stats", headers=auth).json()
+
+    assert api.post(f"{api.base}{MEMBERS}/{created['id']}/erase",
+                    headers=auth).status_code == 200
+
+    rows = ledger(api, auth, range="all", search=code)["items"]
+    assert len(rows) == 1, "the payment must survive the erasure"
+    assert rows[0]["memberName"] == "Deleted member"
+    assert rows[0]["phone"] == "0000000000"
+    assert float(rows[0]["amount"]) == pytest.approx(300.0)
+
+    after = api.get(f"{api.base}{PAYMENTS}/stats", headers=auth).json()
+    assert float(after["thisMonthCollection"]) == pytest.approx(
+        float(before["thisMonthCollection"]))
+
+
+def test_instalments_against_one_membership_share_a_balance(api, auth, member):
+    """balanceAmount is the MEMBERSHIP's, repeated across its rows — not what
+
+    was left after each payment. A stored per-payment remainder is exactly what
+    schema_v1.sql forbids so paid and remaining cannot drift.
+    """
+    pay(api, auth, member, 200)
+    pay(api, auth, member, 300)
+
+    rows = ledger(api, auth, range="all", search=member["memberCode"])["items"]
+    assert len(rows) == 2
+
+    balances = {float(r["balanceAmount"]) for r in rows}
+    assert balances == {500.0}, balances

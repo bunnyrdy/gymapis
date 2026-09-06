@@ -37,6 +37,7 @@ public class GymDbContext : DbContext
     public DbSet<Membership> Memberships => Set<Membership>();
     public DbSet<Payment> Payments => Set<Payment>();
     public DbSet<MemberOverview> MemberOverviews => Set<MemberOverview>();
+    public DbSet<PaymentLedger> PaymentLedger => Set<PaymentLedger>();
     public DbSet<StaffAttendance> StaffAttendance => Set<StaffAttendance>();
     public DbSet<StaffAttendanceMonthly> StaffAttendanceMonthly => Set<StaffAttendanceMonthly>();
     public DbSet<Branch> Branches => Set<Branch>();
@@ -163,6 +164,12 @@ public class GymDbContext : DbContext
             e.ToTable("payments");
             e.Property(x => x.CreatedAt).ValueGeneratedOnAdd();
             e.Property(x => x.UpdatedAt).ValueGeneratedOnAddOrUpdate();
+            // 010_payments_module.sql put a sequence-backed DEFAULT on
+            // receipt_no. Marking it store-generated is the whole of the
+            // receipt-number wiring: EF omits the column on INSERT and reads
+            // the value back with RETURNING, so no write path has to mint one
+            // and no two concurrent payments can race for the same number.
+            e.Property(x => x.ReceiptNo).ValueGeneratedOnAdd();
             // NOT ValueGeneratedOnAdd: the desk can back-date a payment taken
             // earlier, and letting the store generate this would mean whether
             // that value survived depended on EF's sentinel rules. Every write
@@ -175,6 +182,15 @@ public class GymDbContext : DbContext
         {
             e.HasNoKey();
             e.ToView("v_member_overview");
+        });
+
+        // Same shape, for the payments page: the view owns the member,
+        // membership, plan and balance joins so the ledger's Balance Due
+        // cannot disagree with the members list's.
+        b.Entity<PaymentLedger>(e =>
+        {
+            e.HasNoKey();
+            e.ToView("v_payment_ledger");
         });
 
         b.Entity<StaffAttendance>(e =>

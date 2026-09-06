@@ -1,3 +1,4 @@
+using System.Net;
 using System.Text;
 using GymApis;
 using GymApis.Exceptions;
@@ -13,12 +14,14 @@ using GymApis.Services.Email;
 using GymApis.Services.Dashboard;
 using GymApis.Services.Members;
 using GymApis.Services.Membership;
+using GymApis.Services.Payments;
 using GymApis.Services.Messaging;
 using GymApis.Services.Site;
 using GymApis.Services.Staff;
 using GymApis.Services.Storage;
 using Microsoft.AspNetCore.StaticFiles;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.AspNetCore.Mvc;
@@ -97,10 +100,15 @@ builder.Services.AddAuthorization(options =>
     options.AddPolicy(AuthPolicies.MarkAttendance, p =>
         p.RequireAuthenticatedUser().RequireRole(AuthPolicies.MarkAttendanceRoles));
 
-    // Revenue figures. Declared here so a future Payments or Reports controller
-    // can carry it as an [Authorize] attribute; the dashboard enforces the same
-    // role list inside the service, because there the restriction is two fields
-    // of a response rather than the whole endpoint.
+    // Revenue figures. This was declared expecting a future Payments or Reports
+    // controller to carry it as an [Authorize] attribute. Payments arrived and
+    // did not: it enforces the same role list inside PaymentService, the way the
+    // dashboard does, because the restriction is three fields of a response
+    // rather than the whole endpoint. Two reasons it went that way — the front
+    // desk takes the payments and needs the page, and two of the five tabs read
+    // /api/members, so an endpoint gate would produce a screen where three tabs
+    // 403 and two work. Still declared, because a Reports controller is a
+    // genuinely whole-endpoint case.
     options.AddPolicy(AuthPolicies.ViewRevenue, p =>
         p.RequireAuthenticatedUser().RequireRole(AuthPolicies.ViewRevenueRoles));
 
@@ -136,8 +144,14 @@ builder.Services.AddScoped<IMemberService, MemberService>();
 builder.Services.AddScoped<IBranchClock, BranchClock>();
 builder.Services.AddScoped<IAttendanceService, AttendanceService>();
 
-// Reads only, and composes the two services above rather than recounting what
-// they already count — see DashboardService for why that matters.
+// The payments console. Reads only, and composes MemberService.StatsAsync for
+// its outstanding figures rather than recounting them — the Pending Payments tab
+// reads /api/members, so a card counted here would disagree with the rows it
+// opens. It also owns the monthly-collection sum the dashboard used to compute.
+builder.Services.AddScoped<IPaymentService, PaymentService>();
+
+// Reads only, and composes the services above rather than recounting what they
+// already count — see DashboardService for why that matters.
 builder.Services.AddScoped<IDashboardService, DashboardService>();
 
 // The website CMS and its anonymous read model. Two interfaces over two
@@ -239,6 +253,12 @@ builder.Services.AddExceptionHandler<GlobalExceptionHandler>();
 // ---------------------------------------------------------------------------
 builder.Services.AddControllers(options => options.Filters.Add<PayloadSizeGuard>());
 
+// Liveness for the container runtime and the reverse proxy. It checks the
+// database rather than just answering 200, because a process that is up with no
+// connection string is not serving anything — and an orchestrator that restarts
+// on a real failure is the point of having the endpoint at all.
+builder.Services.AddHealthChecks().AddDbContextCheck<GymDbContext>();
+
 // [ApiController]'s automatic 400 emits ValidationProblemDetails, which is
 // close to our shape but carries no `code` and no `traceId`. Re-route it
 // through ApiProblem so a validation failure is indistinguishable in shape
@@ -307,6 +327,32 @@ builder.Services.AddRateLimiter(options =>
                 QueueLimit = RateLimitPolicies.PublicQueueLimit,
             }));
 
+    // Sign-in. Same partitioning as above and for the same reason — see the
+    // comment on RateLimitPolicies.Auth for why this is applied per action
+    // rather than to the whole AuthController.
+    //
+    // The ceiling is configurable, unlike the public one, for two reasons. A
+    // gym behind one office NAT presents every receptionist to us as a single
+    // address, so the right number is a property of the deployment rather than
+    // of the code — and the fix for "the desk is being locked out" must not be
+    // a redeploy. The other reason is the test suite: `tokens` in conftest.py
+    // is function-scoped because the refresh-rotation and reuse-detection tests
+    // each need their own token family, so a run signs in a few hundred times
+    // from 127.0.0.1 and would spend a production-sized budget in seconds. See
+    // appsettings.Development.json.
+    var authLimit = builder.Configuration.GetSection("RateLimiting:Auth");
+    options.AddPolicy(RateLimitPolicies.Auth, http =>
+        RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: http.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = authLimit.GetValue("PermitLimit", RateLimitPolicies.AuthPermitLimit),
+                Window = TimeSpan.FromSeconds(
+                    authLimit.GetValue("WindowSeconds", RateLimitPolicies.AuthWindowSeconds)),
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = RateLimitPolicies.AuthQueueLimit,
+            }));
+
     options.OnRejected = async (context, ct) =>
     {
         var problem = ApiProblem.Create(
@@ -340,10 +386,16 @@ builder.Services.AddOpenApi(options =>
 }); // serves the spec at /openapi/v1.json in Development
 
 const string FrontendCors = "frontend";
+// One entry, from configuration. The hardcoded http://localhost:4173 that used
+// to sit beside it was for `vite preview`, and it is not needed: the demo and
+// production builds both set VITE_API_BASE_URL=/api, so the browser sees a
+// single origin and never issues a cross-origin request at all. In production
+// this whole policy is inert for the same reason — Caddy serves the SPA and the
+// API under one hostname — but it stays wired so a direct-to-API frontend keeps
+// working in development.
 builder.Services.AddCors(o => o.AddPolicy(FrontendCors, p => p
     .WithOrigins(
-        builder.Configuration["Frontend:BaseUrl"] ?? "http://localhost:5173",
-        "http://localhost:4173")
+        builder.Configuration["Frontend:BaseUrl"] ?? "http://localhost:5173")
     .AllowAnyHeader()
     .AllowAnyMethod()));   // Bearer tokens, not cookies — no AllowCredentials needed
 
@@ -392,10 +444,26 @@ if (app.Environment.IsDevelopment())
     // useless for a docs UI. Development-only, so nothing is exposed in prod.
     app.MapOpenApi().AllowAnonymous();
     app.MapScalarApiReference().AllowAnonymous();
-    await SeedOwnerAsync(app);
 }
 
-app.UseHttpsRedirection();
+// Outside the Development block deliberately. This used to sit inside it,
+// which meant a Production database was created with an empty `users` table
+// and no route to a first account — the schema seeds a tenant and a branch but
+// cannot seed a login, because PasswordHasher produces a versioned PBKDF2 blob
+// that can't be hand-written into a .sql file. Nobody could ever sign in.
+//
+// Safe to run everywhere: it returns immediately when Seed:OwnerEmail and
+// Seed:OwnerPassword are absent, and no-ops when that email already exists. In
+// production both come from the environment, and Seed__OwnerPassword is
+// deleted from the compose .env once the owner has changed it in the UI.
+await SeedOwnerAsync(app);
+
+// No UseHttpsRedirection. TLS is terminated at the reverse proxy (see
+// deployment/Caddyfile); this process listens on plain HTTP and is never
+// published. Left in, it logs "Failed to determine the https port for redirect"
+// on every request, and once X-Forwarded-Proto is honoured below it can send a
+// request that already arrived over HTTPS back round the loop. The proxy owns
+// the redirect and the HSTS header.
 
 // Uploaded photos. Two deliberate choices:
 //   * nosniff — a file that is somehow both a valid JPEG and valid HTML can
@@ -438,6 +506,37 @@ app.UseStaticFiles(new StaticFileOptions
 
 app.UseCors(FrontendCors);
 
+// Behind the reverse proxy, every request arrives from the proxy's address on
+// the container network. Without this the rate limiter below partitions every
+// caller on earth into ONE bucket — its 60-per-minute ceiling becomes a global
+// cap, and a single bot locks the marketing site for every real visitor. The
+// limiter turns into the denial of service it exists to prevent.
+//
+// KnownNetworks is an allowlist and must stay one. X-Forwarded-For is a
+// caller-supplied string; honoured from an arbitrary source it lets anyone
+// reset their own bucket by changing a header. Only the proxy on the pinned
+// compose subnet is trusted, and ForwardLimit = 1 means only the hop it added
+// is read — a client that pre-populates the header cannot prepend to it.
+//
+// The subnet is pinned in deployment/docker-compose.yml. The two must agree:
+// widen the compose network and this silently stops matching, which shows up
+// as one shared bucket again rather than as an error.
+var forwardedHeaders = new ForwardedHeadersOptions
+{
+    ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto,
+    ForwardLimit     = 1,
+};
+foreach (var network in builder.Configuration
+             .GetSection("ForwardedHeaders:KnownNetworks").Get<string[]>() ?? [])
+{
+    forwardedHeaders.KnownIPNetworks.Add(System.Net.IPNetwork.Parse(network));
+}
+// The defaults are loopback only, which is right for a bare-metal run and
+// wrong behind compose. Clearing them means an unconfigured deployment trusts
+// nothing and partitions on the socket address — degraded, but never spoofable.
+if (forwardedHeaders.KnownIPNetworks.Count > 0) forwardedHeaders.KnownProxies.Clear();
+app.UseForwardedHeaders(forwardedHeaders);
+
 // After CORS so a preflight is never rate-limited, before authentication so a
 // flood costs no token validation.
 app.UseRateLimiter();
@@ -450,6 +549,12 @@ app.UseMiddleware<RequestContextMiddleware>();
 
 app.UseAuthorization();
 app.MapControllers();
+
+// AllowAnonymous is required, not tidiness: the FallbackPolicy would 401 the
+// probe, the container runtime would read that as unhealthy, and the API would
+// restart-loop forever without a single line explaining why. It exposes nothing
+// — a status word, no version, no connection string, no schema.
+app.MapHealthChecks("/health").AllowAnonymous();
 
 app.Run();
 
@@ -470,8 +575,28 @@ static async Task SeedOwnerAsync(WebApplication app)
     var hasher = scope.ServiceProvider.GetRequiredService<IPasswordHasher<User>>();
     var log    = scope.ServiceProvider.GetRequiredService<ILogger<Program>>();
 
-    if (await db.Users.AnyAsync(u => u.TenantId == Tenancy.TenantId && u.Email == email))
-        return;
+    // The first query against a database with no schema throws from deep inside
+    // Npgsql — "the data type name 'citext' could not be found" — which is a
+    // stack trace about type loading rather than the actual problem, and it
+    // kills the process before a single request is served. In a container that
+    // is a restart loop with the real cause fifteen frames down. Say it plainly
+    // and rethrow: the app genuinely cannot run, but the operator should not
+    // have to read Npgsql internals to learn why.
+    try
+    {
+        if (await db.Users.AnyAsync(u => u.TenantId == Tenancy.TenantId && u.Email == email))
+            return;
+    }
+    catch (Exception ex)
+    {
+        log.LogCritical(ex,
+            "Could not read the users table. The schema has probably not been applied to this "
+            + "database — run sqlfiles/schema_v1.sql and 002 through 010, in that order. "
+            + "In Docker that is deployment/initdb.sh, which only runs on a FRESH volume: "
+            + "a database created before it was wired up keeps its empty schema, and the fix "
+            + "is to apply the files by hand or recreate the volume.");
+        throw;
+    }
 
     var user = new User { TenantId = Tenancy.TenantId, Email = email, Role = "owner" };
     user.PasswordHash = hasher.HashPassword(user, password);

@@ -1,0 +1,20 @@
+# Host build output. Without this, COPY drags in obj/project.assets.json from
+# the developer's machine and it overrides the restore the SDK image just did —
+# the build then fails with NETSDK1064 "package ... was not found", which reads
+# like a NuGet outage rather than a stale file.
+bin/
+obj/
+
+# Uploaded photographs. 23 MB of member and staff images that belong in the
+# runtime volume, not baked into an image layer that gets pushed around.
+wwwroot/uploads/
+
+# Not part of the application: the black-box suite runs against a deployed API.
+tests/
+**/__pycache__/
+.pytest_cache/
+
+# Never
+deployment/.env
+.git/
+.DS_Store

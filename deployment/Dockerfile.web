@@ -1,0 +1,33 @@
+# The SPA, baked into a Caddy image.
+#
+# Built from the FRONTEND repository root, which is a separate checkout:
+#   git clone https://github.com/bunnyrdy/Gym-Management-System-frontend.git
+#   docker build -f ../gymapis/deployment/Dockerfile.web -t steelflex-web .
+#
+# Node exists only in the build stage. The runtime image is Caddy plus static
+# files — no node_modules, no dev server. `vite preview` is a development
+# server and must never face the internet; this is what replaces it.
+
+FROM node:24-slim AS build
+WORKDIR /src
+
+# npm ci, not npm install: it installs exactly the lockfile and fails if the
+# two disagree, so a deploy can never quietly resolve a different dependency
+# tree than the one that was tested.
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . ./
+
+# Uses .env.production — VITE_API_BASE_URL=/api, deliberately relative. No
+# hostname is baked into the bundle, so moving the gym to a new domain is a DNS
+# change and a Caddyfile line rather than a rebuild.
+RUN npm run build
+
+FROM caddy:2-alpine AS runtime
+
+# Only the built site. The Caddyfile is NOT copied in: it lives in the gymapis
+# repo, which is a different build context, and it is bind-mounted by
+# docker-compose.yml instead. That also means editing a header or adding a
+# route is a `docker compose restart caddy`, not an image rebuild.
+COPY --from=build /src/dist /srv
