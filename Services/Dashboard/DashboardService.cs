@@ -33,8 +33,20 @@ namespace GymApis.Services.Dashboard;
 /// </summary>
 public class DashboardService : IDashboardService
 {
-    /// <summary>Rows in the expiring table and names in the not-marked list.</summary>
-    private const int ShortlistSize = 5;
+    /// <summary>
+    /// Rows in the expiring table. Ten, and the card scrolls its own body —
+    /// ten rows unscrolled would run well past the donut and attendance cards
+    /// stacked beside it and leave the dashboard lopsided.
+    /// </summary>
+    private const int ExpiringShortlistSize = 10;
+
+    /// <summary>
+    /// Names in the attendance not-marked list. Separate from the constant
+    /// above, which the two lists used to share: raising the expiring table to
+    /// ten would otherwise have doubled this card too, and its height is part
+    /// of what keeps the sidebar level with the table next to it.
+    /// </summary>
+    private const int NotMarkedShortlistSize = 5;
 
     /// <summary>Entries in the activity feed.</summary>
     private const int FeedSize = 12;
@@ -171,7 +183,7 @@ public class DashboardService : IDashboardService
                      && v.DaysRemaining <= ExpiryWindowDays)
             .OrderBy(v => v.EndDate)
             .ThenBy(v => v.FullName)
-            .Take(ShortlistSize)
+            .Take(ExpiringShortlistSize)
             .Select(v => new ExpiringMembershipItem(
                 v.Id, v.FullName, v.PhotoUrl, v.PlanName,
                 v.EndDate, v.DaysRemaining, v.MembershipState))
@@ -197,7 +209,7 @@ public class DashboardService : IDashboardService
             {
                 Status = AttendanceEnums.NotMarked,
                 Page = 1,
-                PageSize = ShortlistSize,
+                PageSize = NotMarkedShortlistSize,
             }, ct);
 
         return new DashboardAttendance(
